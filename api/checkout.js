@@ -1,9 +1,11 @@
+// api/checkout.js
 import Stripe from 'stripe';
 
+/** -------- Pricing -------- */
 const PRICE = {
   essentials:     { base: 2500, included: 30, extraPer: 8 },
   assurance:      { base: 3000, included: 30, extraPer: 10 },
-  comprehensive:  { base: 5000, included: 60, extraPer: 10 },
+  comprehensive:  { base: 5000, included: 60, extraPer: 10 }
 };
 
 function priceCalc({ planKey, totalPages, years, addonLegal, addonModel }) {
@@ -23,40 +25,85 @@ function priceCalc({ planKey, totalPages, years, addonLegal, addonModel }) {
   }
 
   const total = cfg.base + extraCost + legalAdd + modelAdd;
-  return { ...cfg, extraPages, extraCost, legalAdd, modelAdd, total };
+  return { total };
 }
+
 const toCents = usd => Math.round(Number(usd) * 100);
 const planLabel = k => k==='assurance' ? 'Assurance' : k==='comprehensive' ? 'Comprehensive' : 'Essentials';
-function today(){ const d=new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; }
+const today = () => { const d=new Date(); return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; };
 const makeJobId = () => `DW-${today()}-${Math.floor(Math.random()*900+100)}`;
 
-function cors(res) {
+/** -------- CORS -------- */
+function addCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-export default async function handler(req, res) {
-  cors(res);
-  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
-  try {
-    if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
+/** -------- Robust JSON reader --------
+ * Accepts:
+ *  - already-parsed req.body (Vercel/Next style)
+ *  - raw UTF-8 JSON string
+ *  - application/x-www-form-urlencoded
+ */
+async function readBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
 
+  const chunks = [];
+  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+  const raw = Buffer.concat(chunks).toString('utf8').trim();
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+
+  if (!raw) throw new Error('EMPTY_BODY');
+
+  if (ct.includes('application/json') || raw.startsWith('{') || raw.startsWith('[')) {
+    try { return JSON.parse(raw); }
+    catch { throw new Error('INVALID_JSON'); }
+  }
+
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    const params = new URLSearchParams(raw);
+    const obj = {};
+    for (const [k, v] of params.entries()) obj[k] = v;
+    return obj;
+  }
+
+  // Last-ditch: try JSON anyway
+  try { return JSON.parse(raw); } catch { throw new Error('INVALID_JSON'); }
+}
+
+/** -------- Handler -------- */
+export default async function handler(req, res) {
+  addCORS(res);
+  if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+  if (req.method !== 'POST') { res.status(405).json({ ok:false, error:'Method Not Allowed' }); return; }
+
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (_e) {
+    res.status(400).json({ ok:false, error:'Invalid JSON' });
+    return;
+  }
+
+  try {
     const {
       planKey, totalPages, years, addonLegal, addonModel,
       customerName, customerEmail, customerCompany, dealContext,
       successUrl = 'https://duewiseai.com/success?session_id={CHECKOUT_SESSION_ID}',
       cancelUrl  = 'https://duewiseai.com/cancel'
-    } = req.body || {};
+    } = body;
 
     const jobId = makeJobId();
-    const calc  = priceCalc({ planKey, totalPages, years, addonLegal, addonModel });
+    const { total } = priceCalc({ planKey, totalPages, years, addonLegal, addonModel });
+
     const addons = [
       (addonLegal && planKey!=='essentials') ? 'Legal Deep-Dive' : null,
       (addonModel && planKey!=='essentials') ? 'Financial Modeling' : null,
     ].filter(Boolean).join(', ');
 
     const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       success_url: successUrl,
@@ -65,7 +112,7 @@ export default async function handler(req, res) {
         quantity: 1,
         price_data: {
           currency: 'usd',
-          unit_amount: toCents(calc.total),
+          unit_amount: toCents(total),
           product_data: { name: `DueWise ${planLabel(planKey)} — ${jobId}` }
         }
       }],
@@ -86,3 +133,4 @@ export default async function handler(req, res) {
     res.status(400).json({ ok:false, error: String(e?.message || e) });
   }
 }
+
