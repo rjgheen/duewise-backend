@@ -1,6 +1,7 @@
+// api/stripe-webhook.js
 import Stripe from 'stripe';
 
-// ----- Dropbox helpers -----
+// Dropbox helpers (duplicated here for simplicity)
 async function dbxToken() {
   const body = new URLSearchParams();
   body.set('grant_type', 'refresh_token');
@@ -44,7 +45,7 @@ async function createDropboxJob({ customerCompany, jobId }) {
   return { uploadUrl: fr?.url, fileRequestId: fr?.id, basePath };
 }
 
-// Required for raw body (Stripe signature)
+// Stripe needs raw body
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
@@ -52,7 +53,7 @@ export default async function handler(req, res) {
 
   const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
 
-  // Read raw body
+  // raw body
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks);
@@ -83,19 +84,13 @@ export default async function handler(req, res) {
         }
         break;
       }
-      case 'checkout.session.async_payment_failed':
-      case 'checkout.session.expired':
-      case 'payment_intent.payment_failed':
-      case 'charge.refunded':
-      case 'charge.refund.updated':
-      case 'charge.dispute.created':
-      case 'charge.dispute.closed':
+      default:
+        // we log other events but no action required
         console.log('Stripe event:', event.type);
-        break;
-      default: break;
     }
     res.status(200).json({ received: true, type: event.type });
   } catch (e) {
     res.status(500).json({ received:false, error: String(e?.message || e) });
   }
 }
+
