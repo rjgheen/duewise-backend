@@ -1,8 +1,9 @@
 {
   "name": "duewise-backend",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "stripe": "^14.0.0"
+    "google-auth-library": "9.14.1"
   }
 }
