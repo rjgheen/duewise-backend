@@ -1,7 +1,7 @@
 // api/stripe-webhook.js
 import Stripe from 'stripe';
 
-// ---- Dropbox helpers (unchanged) ----
+// ---------- Dropbox helpers ----------
 async function dbxToken() {
   const body = new URLSearchParams();
   body.set('grant_type', 'refresh_token');
@@ -15,7 +15,7 @@ async function dbxToken() {
     body
   });
   const j = await r.json();
-  if (!r.ok || !j.access_token) throw new Error(`Dropbox token failed ${r.status}: ${JSON.stringify(j)}`);
+  if (!r.ok || !j.access_token) throw new Error(`Dropbox token ${r.status}: ${JSON.stringify(j)}`);
   return j.access_token;
 }
 function ensureSlash(p){ return p.startsWith('/') ? p : `/${p}`; }
@@ -54,7 +54,7 @@ async function createDropboxJob({ customerCompany, jobId }) {
   return { uploadUrl: fr?.url, fileRequestId: fr?.id, basePath };
 }
 
-// Stripe needs raw body
+// Stripe needs raw body for signature verification
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
@@ -68,20 +68,13 @@ export default async function handler(req, res) {
   const raw = Buffer.concat(chunks);
 
   const sig = req.headers['stripe-signature'];
-  if (!sig) {
-    console.warn('[webhook] Missing stripe-signature header');
-    return res.status(400).json({ received:false, error:'Missing stripe-signature' });
-  }
-
   let event;
   try {
     event = stripe.webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    // Log enough to debug, without leaking secrets
     console.warn('[webhook] Signature verify failed', {
       msg: String(err?.message || err),
       sigPresent: !!sig,
-      sigLen: String(sig).length,
       rawLen: raw.length
     });
     return res.status(400).json({ received:false, error:'signature_verification_failed' });
@@ -96,15 +89,27 @@ export default async function handler(req, res) {
         const jobId = md.jobId || session.client_reference_id || session.id;
         const customerCompany = md.customerCompany || 'Client';
 
-        if (!jobId) {
-          console.log('[webhook] No jobId present; skipping Dropbox');
-        } else {
+        if (jobId) {
           try {
             const { uploadUrl } = await createDropboxJob({ customerCompany, jobId });
             console.log('[webhook] Dropbox ready:', { jobId, uploadUrl });
+
+            // save upload link onto PaymentIntent metadata for easy lookup later
+            if (session.payment_intent) {
+              await stripe.paymentIntents.update(session.payment_intent, {
+                metadata: {
+                  ...(md || {}),
+                  jobId,
+                  uploadUrl,
+                  status: 'paid'
+                }
+              });
+            }
           } catch (e) {
             console.error('[webhook] Dropbox error', e);
           }
+        } else {
+          console.log('[webhook] No jobId present; skipping Dropbox');
         }
         break;
       }
@@ -118,3 +123,4 @@ export default async function handler(req, res) {
     res.status(500).json({ received:false, error: String(e?.message || e) });
   }
 }
+
