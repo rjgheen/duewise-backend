@@ -2,160 +2,144 @@
 export const config = { api: { bodyParser: false } };
 
 import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
-
-import { kv } from '@vercel/kv';
-const mem = new Set(); // fallback if KV not configured
-
-import { newJobId, nowIso } from '../lib/util.js';
+import { readRawBody, todayYMD } from '../lib/util.js';
 import { createDropboxIntake } from '../lib/dropbox.js';
 import { sendMail } from '../lib/email.js';
-import { upsertWixOrder } from '../lib/wix.js';
-
-function hasKV() {
-  return !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
-}
-async function alreadyProcessed(id) {
-  if (!id) return false;
-  if (hasKV()) return !!(await kv.get(`stripe_evt:${id}`));
-  return mem.has(id);
-}
-async function markProcessed(id) {
-  if (!id) return;
-  if (hasKV()) await kv.set(`stripe_evt:${id}`, '1', { ex: 60 * 60 * 24 * 7 }); // 7 days
-  else mem.add(id);
-}
-
-function resolveBuyerEmail(session) {
-  return session?.customer_details?.email ||
-         session?.customer_email ||
-         session?.metadata?.customerEmail ||
-         session?.metadata?.email || null;
-}
+import { upsertOrder } from '../lib/wix.js';
+import { kv } from '@vercel/kv';
+import { indexJobMeta } from '../lib/jobs.js';
 
 export default async function handler(req, res) {
   try {
-    const buf = await raw(req);
+    if (req.method !== 'POST') return res.status(405).send('Method not allowed');
+    const stripe = new Stripe(process.env.STRIPE_SECRET, { apiVersion: '2024-06-20' });
     const sig = req.headers['stripe-signature'];
-    const secret = process.env.STRIPE_WEBHOOK_SECRET;
-    if (!sig || !secret) return res.status(500).json({ ok:false, error:'webhook not configured' });
-
-    let event;
+    const raw = await readRawBody(req);
+    let evt;
     try {
-      event = stripe.webhooks.constructEvent(buf, sig, secret);
-    } catch (e) {
-      return res.status(400).json({ ok:false, error:`signature verify failed: ${e.message}` });
+      evt = stripe.webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('[webhook] verify fail', err);
+      return res.status(400).send('Bad signature');
     }
 
-    if (await alreadyProcessed(event.id)) {
-      return res.status(200).json({ ok:true, dedup:true });
+    // Idempotency across retries
+    const evtKey = `dw:stripe_evt:${evt.id}`;
+    if (await kv.get(evtKey)) {
+      return res.status(200).json({ ok: true, dedupe: true });
     }
 
-    if (event.type === 'checkout.session.completed' ||
-        event.type === 'checkout.session.async_payment_succeeded') {
-      const s = event.data.object;
+    switch (evt.type) {
+      case 'checkout.session.completed':
+      case 'checkout.session.async_payment_succeeded': {
+        const s = evt.data.object;
+        const sessionId = s.id;
+        const customerEmail = s.customer_details?.email || s.customer_email || s.metadata?.customerEmail || '';
+        const customerName = s.metadata?.customerName || '';
+        const customerCompany = s.metadata?.customerCompany || 'Client';
+        const planKey = s.metadata?.planKey || '';
+        const planLabel = s.metadata?.planLabel || '';
+        const totalPages = Number(s.metadata?.totalPages || 0);
+        const years = Number(s.metadata?.years || 1);
+        const addons = s.metadata?.addons || '';
+        const total = (s.amount_total || 0) / 100;
 
-      const planKey = s?.metadata?.planKey || 'assurance';
-      const planLabel = s?.metadata?.planLabel || '';
-      const totalPages = Number(s?.metadata?.totalPages || 0);
-      const years = Number(s?.metadata?.years || 1);
-      const addons = s?.metadata?.addons || '';
-      const customerName = s?.metadata?.customerName || s?.customer_details?.name || 'Customer';
-      const customerEmail = resolveBuyerEmail(s);
-      const customerCompany = s?.metadata?.customerCompany || 'Client';
-      const dealContext = s?.metadata?.dealContext || '';
-      const amountTotal = (s.amount_total ?? 0) / 100;
+        // generate jobId with KV-backed sequence per day
+        const day = todayYMD();
+        const seqKey = `dw:seq:${day}`;
+        const seq = await kv.incr(seqKey);
+        await kv.expire(seqKey, 86400 * 7);
+        const jobId = `DW-${day}-${String(seq).padStart(3, '0')}`;
 
-      const jobId = newJobId();
+        // Dropbox intake
+        const { uploadUrl, baseFolder, intakePath, workingPath } =
+          await createDropboxIntake({ company: customerCompany, jobId });
 
-      // Dropbox intake
-      const { uploadUrl, baseFolder } = await createDropboxIntake({ company: customerCompany, jobId });
+        // index job for cron
+        await indexJobMeta({
+          jobId, baseFolder, intakePath, workingPath,
+          customerEmail, customerCompany,
+          createdAt: new Date().toISOString()
+        });
 
-      // Buyer email (if we have email)
-      if (customerEmail) {
+        // email buyer
         const buyerHtml = `
-          <p>Hi ${customerName.split(' ')[0]},</p>
-          <p>Thanks for your order. Your Job ID is <b>${jobId}</b>.</p>
-          <p>Please upload your documents using this link:</p>
+          <p>Hi ${customerName || ''},</p>
+          <p>Your DueWise job <b>${jobId}</b> is confirmed. Upload your files here:</p>
           <p><a href="${uploadUrl}">${uploadUrl}</a></p>
           <hr/>
-          <p><b>Order Summary</b><br/>
-          Plan: ${planLabel || planKey}<br/>
-          Pages: ${totalPages} &nbsp;|&nbsp; Years: ${years}<br/>
-          Add-ons: ${addons || 'None'}<br/>
-          Context: ${dealContext || '—'}</p>
-          <p>— DueWise</p>
+          <p><b>Order summary</b><br/>
+          Tier: ${planLabel} (${planKey})<br/>
+          Pages: ${totalPages}; Years: ${years}; Add-ons: ${addons || 'None'}<br/>
+          Paid: $${total.toFixed(2)}</p>
         `;
-        await sendMail({ to: customerEmail, subject: `DueWise — Upload Link for Job ${jobId}`, html: buyerHtml });
+        if (customerEmail) {
+          await sendMail({
+            to: customerEmail,
+            subject: `DueWise — Upload link for ${jobId}`,
+            html: buyerHtml
+          });
+        }
+
+        // email ops
+        const ops = process.env.OPS_EMAIL || 'ops@duewiseai.com';
+        const opsHtml = `
+          <p><b>PAID</b> — ${jobId}</p>
+          <ul>
+            <li>Customer: ${customerName} — ${customerEmail}</li>
+            <li>Company: ${customerCompany}</li>
+            <li>Plan: ${planLabel} (${planKey})</li>
+            <li>Pages: ${totalPages}; Years: ${years}; Add-ons: ${addons || 'None'}</li>
+            <li>Total: $${total.toFixed(2)}</li>
+            <li>Folder: ${baseFolder}</li>
+            <li>Intake: ${intakePath}</li>
+            <li>Working: ${workingPath}</li>
+            <li>Upload URL: <a href="${uploadUrl}">${uploadUrl}</a></li>
+          </ul>
+        `;
+        await sendMail({ to: ops, subject: `PAID — ${jobId}`, html: opsHtml });
+
+        // upsert wix
+        await upsertOrder({
+          stripeSessionId: sessionId,
+          sessionId,
+          uploadUrl,
+          jobId,
+          planLabel,
+          planKey,
+          totalPages,
+          years,
+          addons,
+          total,
+          status: 'paid',
+          customerName,
+          customerEmail,
+          customerCompany,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+
+        await kv.set(evtKey, 1, { ex: 60 * 60 * 24 * 30 }); // 30 days
+        return res.status(200).json({ ok: true, jobId, uploadUrl });
       }
 
-      // Ops email
-      const ops = process.env.OPS_EMAIL || 'ops@duewiseai.com';
-      const opsHtml = `
-        <p>New PAID order</p>
-        <ul>
-          <li><b>${jobId}</b></li>
-          <li>Customer: ${customerName} (${customerEmail || 'no email'})</li>
-          <li>Company: ${customerCompany}</li>
-          <li>Plan: ${planLabel || planKey}</li>
-          <li>Pages: ${totalPages} | Years: ${years}</li>
-          <li>Add-ons: ${addons || 'None'}</li>
-          <li>Context: ${dealContext || '—'}</li>
-          <li>Dropbox: ${baseFolder}</li>
-          <li>Upload URL: <a href="${uploadUrl}">${uploadUrl}</a></li>
-          <li>Stripe session: ${s.id}</li>
-        </ul>`;
-      await sendMail({ to: ops, subject: `New Job ${jobId} — ${planLabel || planKey}`, html: opsHtml });
+      case 'checkout.session.async_payment_failed':
+      case 'checkout.session.expired':
+      case 'payment_intent.payment_failed':
+      case 'charge.refunded':
+      case 'charge.dispute.created':
+      case 'charge.dispute.closed': {
+        // soft-ack & mark event as processed (extend later if needed)
+        await kv.set(evtKey, 1, { ex: 60 * 60 * 24 * 30 });
+        return res.status(200).json({ ok: true, type: evt.type });
+      }
 
-      // Upsert Wix order (matches your exact field keys & types)
-      const now = nowIso();
-      const wixDoc = {
-        stripeSessionId: s.id,
-        sessionId: s.id,
-        uploadUrl,
-        jobId,
-        planLabel: planLabel || planKey,
-        planKey,
-        totalPages,
-        years,
-        addons,
-        total: amountTotal,
-        status: 'paid',
-        customerName,
-        customerEmail: customerEmail || '',
-        customerCompany,
-        createdAt: s.created ? new Date(s.created * 1000).toISOString() : now,
-        updatedAt: now
-      };
-      try { await upsertWixOrder(wixDoc); } catch (e) { /* log-only */ console.warn('[wix upsert failed]', e.message); }
-
-      await markProcessed(event.id);
-      return res.status(200).json({ ok:true, jobId, uploadUrl });
+      default:
+        await kv.set(evtKey, 1, { ex: 60 * 60 * 24 * 30 });
+        return res.status(200).json({ ok: true, passthrough: evt.type });
     }
-
-    // Other status events → update Wix + alert ops (optional to implement now)
-    if ([
-      'checkout.session.async_payment_failed',
-      'checkout.session.expired',
-      'payment_intent.payment_failed',
-      'charge.refunded',
-      'charge.dispute.created',
-      'charge.dispute.closed'
-    ].includes(event.type)) {
-      // TODO: upsert Wix with appropriate status; email ops as needed.
-      await markProcessed(event.id);
-      return res.status(200).json({ ok:true, handled:event.type });
-    }
-
-    await markProcessed(event.id);
-    return res.status(200).json({ ok:true, ignored:true, type:event.type });
   } catch (e) {
-    console.error('[webhook] error', e);
-    return res.status(500).json({ ok:false, error:String(e.message || e) });
+    console.error('[stripe-webhook]', e);
+    return res.status(500).send('Webhook error');
   }
-}
-
-async function raw(req) {
-  const chunks = []; for await (const c of req) chunks.push(Buffer.isBuffer(c)?c:Buffer.from(c));
-  return Buffer.concat(chunks);
 }
