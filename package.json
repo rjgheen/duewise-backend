@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=18.17" },
   "dependencies": {
-    "@vercel/kv": "1.0.1",
+    "@vercel/kv": "^1.0.1",
     "google-auth-library": "9.14.1",
-    "stripe": "16.6.0"
+    "stripe": "16.5.0"
   }
 }
